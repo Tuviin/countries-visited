@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+===================================================================================
+CLAUDE DEVELOPER NOTES — Countries Visited App
+Last updated: 2026-03-08
+===================================================================================
+
+OVERVIEW:
+  Single-file HTML app. No build step, no server. Open directly in Chrome or iOS Safari.
+  Leaflet.js for the map, CartoDB dark tiles (no API key needed).
+  world-atlas@2 TopoJSON loaded from jsDelivr CDN at runtime.
+  topojson-client@3 loaded from cdnjs CDN at runtime.
+
+ARCHITECTURE:
+  - Map init: Leaflet, worldCopyJump:true for infinite horizontal panning
+  - GeoJSON: TopoJSON → GeoJSON via topojson.feature(), then fixAntimeridian()
+  - Country names: static ISO 3166-1 numeric → name map in getCountryNames()
+  - State: visited{} object: { countryName: { color, layer } }
+  - Sidebar: alphabetically sorted list, click to fly-to, ✕ to remove
+  - Counter: live count of selected countries in header
+
+KEY FIXES ALREADY APPLIED:
+  1. ANTIMERIDIAN: Russia, Fiji, Kiribati, Alaska all cross ±180° longitude.
+     Fixed via fixAntimeridian() which unwraps polygon ring coordinates so
+     consecutive points never jump more than 180°. Do not remove this.
+  2. BLANK PAGE ON SAVE: The download <a> element must be appended to
+     document.body before .click(), then removed + URL revoked after 200ms.
+     Do not revert to the detached element pattern.
+  3. BELIZE (and others): Was missing from name map and filtered out.
+     The filter has been removed entirely — unknown IDs show as "Region <id>"
+     instead of disappearing. Antarctica = ID 10.
+  4. WORLD WRAP: worldCopyJump:true on map init + setMaxBounds(null) after
+     GeoJSON layer loads. Tiles wrap natively; GeoJSON snaps back correctly.
+  5. iOS SAFARI COMPATIBILITY (2026-03-08):
+     a. Color picker: input[type=color] not supported on iOS. Replaced with
+        6 preset color swatches (.color-swatch). Hidden <input id=colorPicker>
+        kept for JS compatibility. initSwatches() wires up click handlers.
+     b. Touch events: mouseover/mouseout don't fire on iOS. onEachFeature now
+        checks window.matchMedia('(hover: none)') and skips hover effects on
+        touch devices. Click shows a brief tooltip instead.
+     c. File input: Dynamically created input.click() is blocked by iOS Safari.
+        loadSession() now uses a persistent #_fileInput element in the DOM.
+     d. Save/download: createObjectURL downloads are unreliable on iOS.
+        saveSession() detects iOS via userAgent and uses FileReader+dataURL instead.
+     e. Remove button: opacity:0 until hover is invisible on touch.
+        @media (hover: none) sets opacity:0.6 always.
+     f. Responsive layout: @media (max-width:600px) stacks sidebar below map
+        and adjusts header for narrow screens.
+
+CLICK BEHAVIOR:
+  - Click/tap unvisited country → highlight with current color swatch color
+  - Click/tap visited country → deselect (remove highlight)
+  - Click country in sidebar → fly to it on map
+  - ✕ in sidebar → remove country
+
+SESSION PERSISTENCE:
+  - localStorage: auto-saves on every Save click, auto-restores on page open
+  - JSON file download: triggered on Save, loadable via Load button
+  - Saved data format: { visited: { countryName: hexColor }, color: hex, savedAt: ISO }
+
+COLOR SWATCHES:
+  - 6 preset colors defined as .color-swatch divs in .color-picker-wrap
+  - To add colors: add another <div class="color-swatch" style="background:#hex" data-color="#hex">
+  - Active swatch gets white border + scale(1.2) transform
+  - Hidden input[type=color] #colorPicker retains color state for JS
+
+COUNTRY NAME MAP:
+  - Located in getCountryNames() function
+  - Keys are ISO 3166-1 numeric codes (integers)
+  - Covers ~250 countries/territories
+  - To add a missing country: find its ISO numeric code and add to the map
+  - To rename a region: add its numeric ID with the desired name
+
+FONTS: Playfair Display (headings), DM Sans (body) — loaded from Google Fonts
+COLORS: CSS variables in :root — dark navy theme, gold accents (#c9a84c)
+
+TILE LAYER: https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png
+  - No API key required
+  - dark_nolabels variant used (country labels handled via Leaflet tooltips)
+
+IF THINGS BREAK:
+  - CDN down? topojson and world-atlas are the two runtime dependencies.
+    Fallback: bundle topojson inline or switch to a GeoJSON source.
+  - Countries not clickable? Check that geoJsonLayer.onEachFeature fired.
+  - Antimeridian lines reappear? fixAntimeridian() was removed or not called.
+  - iOS save not downloading? iOS only allows downloads in response to direct user
+    gesture. The FileReader/dataURL approach in saveSession() handles this.
+===================================================================================
+-->
+
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Countries Visited</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #181c27;
+    --border: #2a2f42;
+    --accent: #c9a84c;
+    --accent2: #e8c96d;
+    --text: #e8e4d9;
+    --text-muted: #7a7f94;
+    --highlight: #c9a84c33;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+  }
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    /* 100vh includes browser chrome on iOS — use fill-available as fix */
+    height: 100vh;
+    height: -webkit-fill-available;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* HEADER */
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    z-index: 1000;
+  }
+  .header-left {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  header h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--accent2);
+    letter-spacing: 0.02em;
+  }
+  .counter {
+    background: var(--accent);
+    color: #0f1117;
+    font-family: 'Playfair Display', serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .counter-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-weight: 300;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .color-picker-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+  }
+  .color-picker-wrap label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  input[type="color"] {
+    width: 32px;
+    height: 28px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    background: none;
+    padding: 0;
+  }
+  /* iOS-compatible color swatches */
+  .color-swatches {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+  }
+  .color-swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: transform 0.1s, border-color 0.1s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .color-swatch.active {
+    border-color: #fff;
+    transform: scale(1.2);
+  }
+  .btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent2); }
+  .btn-primary {
+    background: var(--accent);
+    color: #0f1117;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .btn-primary:hover { background: var(--accent2); border-color: var(--accent2); color: #0f1117; }
+
+  /* MAIN LAYOUT */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    /* iOS Safari needs min-height:0 or flex children won't shrink correctly */
+    min-height: 0;
+  }
+
+  /* MAP */
+  #map {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    background: #1a2035;
+  }
+  .leaflet-container { background: #1a2035; }
+  .leaflet-control-zoom a {
+    background: var(--panel) !important;
+    color: var(--text) !important;
+    border-color: var(--border) !important;
+  }
+  .leaflet-control-zoom a:hover { background: var(--border) !important; }
+  .leaflet-control-attribution { display: none; }
+
+  /* SIDEBAR */
+  .sidebar {
+    width: 260px;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  /* On small screens, sidebar moves below the map */
+  @media (max-width: 600px) {
+    .main { flex-direction: column; }
+    .sidebar {
+      width: 100%;
+      border-left: none;
+      border-top: 1px solid var(--border);
+      height: 200px;
+      flex-shrink: 0;
+    }
+    header { padding: 0 12px; height: auto; min-height: 56px; flex-wrap: wrap; gap: 6px; padding-top: 6px; padding-bottom: 6px; }
+    header h1 { font-size: 1.2rem; }
+    .header-right { gap: 6px; flex-wrap: wrap; }
+    .btn { padding: 5px 10px; font-size: 0.72rem; }
+    .color-picker-wrap { padding: 4px 8px; }
+    .color-picker-wrap label { display: none; }
+    #map { min-height: 0; flex: 1; }
+  }
+  .sidebar-header {
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .sidebar-header h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: 1rem;
+    color: var(--accent2);
+    font-weight: 700;
+  }
+  .sidebar-header p {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+  .country-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+  .country-list::-webkit-scrollbar { width: 4px; }
+  .country-list::-webkit-scrollbar-track { background: transparent; }
+  .country-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .country-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 18px;
+    transition: background 0.1s;
+    cursor: pointer;
+  }
+  .country-item:hover { background: var(--highlight); }
+  .country-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.15);
+  }
+  .country-name {
+    font-size: 0.82rem;
+    flex: 1;
+  }
+  .country-remove {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.1s;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+  .country-item:hover .country-remove { opacity: 1; }
+  /* Always show remove on touch devices */
+  @media (hover: none) {
+    .country-remove { opacity: 0.6; }
+  }
+  .country-remove:hover { background: #ff4d4d33; color: #ff6b6b; }
+  .empty-state {
+    padding: 32px 18px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    line-height: 1.6;
+  }
+  .empty-state .icon {
+    font-size: 2rem;
+    margin-bottom: 10px;
+    display: block;
+    opacity: 0.5;
+  }
+
+  /* TOOLTIP */
+  .leaflet-tooltip {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.78rem;
+    border-radius: 6px;
+    padding: 4px 10px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .leaflet-tooltip-top:before { border-top-color: var(--border); }
+
+  /* INSTRUCTIONS TOAST */
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    padding: 8px 16px;
+    border-radius: 20px;
+    z-index: 9999;
+    pointer-events: none;
+    transition: opacity 0.5s;
+    white-space: nowrap;
+    max-width: 90vw;
+    white-space: normal;
+    text-align: center;
+  }
+  .toast.error {
+    border-color: #ff6b6b;
+    color: #ff6b6b;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>Countries Visited</h1>
+    <div class="counter" id="counter">0</div>
+    <span class="counter-label">countries</span>
+  </div>
+  <div class="header-right">
+    <div class="color-picker-wrap">
+      <label>Color</label>
+      <div class="color-swatches" id="colorSwatches">
+        <div class="color-swatch active" style="background:#c9a84c" data-color="#c9a84c"></div>
+        <div class="color-swatch" style="background:#4caf92" data-color="#4caf92"></div>
+        <div class="color-swatch" style="background:#5b8dd9" data-color="#5b8dd9"></div>
+        <div class="color-swatch" style="background:#d95b5b" data-color="#d95b5b"></div>
+        <div class="color-swatch" style="background:#9b5bd9" data-color="#9b5bd9"></div>
+        <div class="color-swatch" style="background:#d9895b" data-color="#d9895b"></div>
+      </div>
+      <!-- Hidden input kept for JS compatibility -->
+      <input type="color" id="colorPicker" value="#c9a84c" style="display:none">
+    </div>
+    <button class="btn" onclick="clearAll()">Clear All</button>
+    <button class="btn" onclick="loadSession()">Load</button>
+    <button class="btn btn-primary" onclick="saveSession()">Save</button>
+  </div>
+</header>
+
+<div class="main">
+  <div id="map"></div>
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h2>Visited Countries</h2>
+      <p>Click a country on the map to add it</p>
+    </div>
+    <div class="country-list" id="countryList">
+      <div class="empty-state">
+        <span class="icon">🌍</span>
+        No countries selected yet.<br>Click any country on the map to get started.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast">Click any country to highlight it</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+const visited = {}; // { countryName: { color, layer } }
+let geoJsonLayer = null;
+let allFeatures = [];
+
+// ─── MAP INIT ─────────────────────────────────────────────────────────────────
+// Deferred until DOMContentLoaded so #map has a real pixel size before Leaflet measures it.
+// On iOS WebKit, inline script execution can precede layout, giving Leaflet a 0×0 container.
+const map = L.map('map', {
+  center: [20, 0],
+  zoom: 2,
+  minZoom: 2,
+  maxZoom: 10,
+  zoomControl: true,
+  worldCopyJump: true,
+});
+
+// Natural Earth tile — open source, no API key
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+  attribution: '© OpenStreetMap, © CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19
+}).addTo(map);
+
+// ─── ANTIMERIDIAN FIX ────────────────────────────────────────────────────────
+// Splits polygons that cross the antimeridian (±180°) so Leaflet renders them correctly.
+// Affects Russia, Fiji, USA (Alaska), Kiribati, etc.
+function fixAntimeridian(geojson) {
+  geojson.features = geojson.features.map(feature => {
+    if (!feature.geometry) return feature;
+    const type = feature.geometry.type;
+    if (type === 'Polygon') {
+      feature.geometry.coordinates = feature.geometry.coordinates.map(ring => fixRing(ring));
+    } else if (type === 'MultiPolygon') {
+      feature.geometry.coordinates = feature.geometry.coordinates.map(poly =>
+        poly.map(ring => fixRing(ring))
+      );
+    }
+    return feature;
+  });
+  return geojson;
+}
+
+function fixRing(ring) {
+  // Unwrap longitudes so that consecutive points never jump more than 180°
+  const fixed = [ring[0].slice()];
+  for (let i = 1; i < ring.length; i++) {
+    const prev = fixed[i - 1];
+    const curr = ring[i].slice();
+    let lng = curr[0];
+    const prevLng = prev[0];
+    // Adjust longitude to be within 180° of the previous point
+    while (lng - prevLng > 180) lng -= 360;
+    while (prevLng - lng > 180) lng += 360;
+    curr[0] = lng;
+    fixed.push(curr);
+  }
+  return fixed;
+}
+
+async function init() {
+  showToast('Loading map data…');
+  try {
+    // topojson loaded via <script> tag in <head> — no dynamic load needed
+
+    // Use XMLHttpRequest instead of fetch() — more reliable on iOS when
+    // opening as a local file:// URL, which can block fetch() to CDNs
+    const topo = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json');
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); }
+          catch(e) { reject(new Error('JSON parse failed: ' + e.message)); }
+        } else {
+          reject(new Error('HTTP ' + xhr.status + ' loading map data'));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error loading map data — check connection'));
+      xhr.ontimeout = () => reject(new Error('Timeout loading map data'));
+      xhr.timeout = 15000;
+      xhr.send();
+    });
+
+    // Convert to GeoJSON
+    const geojson = topojson.feature(topo, topo.objects.countries);
+
+    // Fix antimeridian artifacts (Russia, Fiji, etc.)
+    fixAntimeridian(geojson);
+
+    // Country names
+    const nameMap = await getCountryNames();
+
+    geojson.features.forEach(f => {
+      f.properties = f.properties || {};
+      const name = nameMap[parseInt(f.id)];
+      f.properties.name = name || ('Region ' + f.id);
+    });
+
+    initLayers(geojson);
+    hideToast();
+  } catch(e) {
+    console.error(e);
+    // Show the actual error message so it's diagnosable
+    const t = document.getElementById('toast');
+    t.classList.add('error');
+    showToast('Map error: ' + e.message);
+  }
+}
+
+async function getCountryNames() {
+  // Complete ISO 3166-1 numeric → name map
+  // Covers every feature ID present in world-atlas countries-50m.json
+  return {
+    4:"Afghanistan",8:"Albania",12:"Algeria",16:"American Samoa",
+    20:"Andorra",24:"Angola",660:"Anguilla",28:"Antigua and Barbuda",
+    32:"Argentina",51:"Armenia",533:"Aruba",36:"Australia",40:"Austria",
+    31:"Azerbaijan",44:"Bahamas",48:"Bahrain",50:"Bangladesh",52:"Barbados",
+    112:"Belarus",56:"Belgium",84:"Belize",204:"Benin",60:"Bermuda",
+    64:"Bhutan",68:"Bolivia",70:"Bosnia and Herzegovina",72:"Botswana",
+    76:"Brazil",96:"Brunei",100:"Bulgaria",854:"Burkina Faso",108:"Burundi",
+    132:"Cape Verde",116:"Cambodia",120:"Cameroon",124:"Canada",136:"Cayman Islands",
+    140:"Central African Republic",148:"Chad",152:"Chile",156:"China",
+    162:"Christmas Island",166:"Cocos Islands",170:"Colombia",174:"Comoros",
+    178:"Republic of the Congo",180:"Dem. Rep. Congo",184:"Cook Islands",
+    188:"Costa Rica",191:"Croatia",192:"Cuba",531:"Curaçao",196:"Cyprus",
+    203:"Czech Republic",208:"Denmark",262:"Djibouti",212:"Dominica",
+    214:"Dominican Republic",218:"Ecuador",818:"Egypt",222:"El Salvador",
+    226:"Equatorial Guinea",232:"Eritrea",233:"Estonia",231:"Ethiopia",
+    238:"Falkland Islands",234:"Faroe Islands",242:"Fiji",246:"Finland",
+    250:"France",254:"French Guiana",258:"French Polynesia",
+    260:"French Southern Territories",266:"Gabon",270:"Gambia",268:"Georgia",
+    276:"Germany",288:"Ghana",292:"Gibraltar",300:"Greece",304:"Greenland",
+    308:"Grenada",312:"Guadeloupe",316:"Guam",320:"Guatemala",324:"Guinea",
+    624:"Guinea-Bissau",328:"Guyana",332:"Haiti",340:"Honduras",344:"Hong Kong",
+    348:"Hungary",352:"Iceland",356:"India",360:"Indonesia",364:"Iran",
+    368:"Iraq",372:"Ireland",376:"Israel",380:"Italy",388:"Jamaica",
+    392:"Japan",400:"Jordan",398:"Kazakhstan",404:"Kenya",296:"Kiribati",
+    414:"Kuwait",417:"Kyrgyzstan",418:"Laos",428:"Latvia",422:"Lebanon",
+    426:"Lesotho",430:"Liberia",434:"Libya",438:"Liechtenstein",440:"Lithuania",
+    442:"Luxembourg",446:"Macao",807:"North Macedonia",450:"Madagascar",
+    454:"Malawi",458:"Malaysia",462:"Maldives",466:"Mali",470:"Malta",
+    584:"Marshall Islands",474:"Martinique",478:"Mauritania",480:"Mauritius",
+    175:"Mayotte",484:"Mexico",583:"Micronesia",498:"Moldova",492:"Monaco",
+    496:"Mongolia",499:"Montenegro",500:"Montserrat",504:"Morocco",
+    508:"Mozambique",104:"Myanmar",516:"Namibia",520:"Nauru",524:"Nepal",
+    528:"Netherlands",540:"New Caledonia",554:"New Zealand",558:"Nicaragua",
+    562:"Niger",566:"Nigeria",570:"Niue",574:"Norfolk Island",
+    408:"North Korea",580:"Northern Mariana Islands",578:"Norway",512:"Oman",
+    586:"Pakistan",585:"Palau",275:"Palestine",591:"Panama",
+    598:"Papua New Guinea",600:"Paraguay",604:"Peru",608:"Philippines",
+    612:"Pitcairn",616:"Poland",620:"Portugal",630:"Puerto Rico",634:"Qatar",
+    638:"Réunion",642:"Romania",643:"Russia",646:"Rwanda",
+    652:"Saint Barthélemy",654:"Saint Helena",659:"Saint Kitts and Nevis",
+    662:"Saint Lucia",663:"Saint Martin",666:"Saint Pierre and Miquelon",
+    670:"Saint Vincent and the Grenadines",882:"Samoa",674:"San Marino",
+    678:"Sao Tome and Principe",682:"Saudi Arabia",686:"Senegal",688:"Serbia",
+    690:"Seychelles",694:"Sierra Leone",703:"Slovakia",705:"Slovenia",
+    90:"Solomon Islands",706:"Somalia",710:"South Africa",239:"South Georgia",
+    410:"South Korea",728:"South Sudan",724:"Spain",144:"Sri Lanka",
+    729:"Sudan",740:"Suriname",748:"Eswatini",752:"Sweden",756:"Switzerland",
+    760:"Syria",158:"Taiwan",762:"Tajikistan",834:"Tanzania",764:"Thailand",
+    626:"Timor-Leste",768:"Togo",776:"Tonga",780:"Trinidad and Tobago",
+    788:"Tunisia",792:"Turkey",795:"Turkmenistan",796:"Turks and Caicos Islands",
+    798:"Tuvalu",800:"Uganda",804:"Ukraine",784:"United Arab Emirates",
+    826:"United Kingdom",840:"United States",858:"Uruguay",860:"Uzbekistan",
+    548:"Vanuatu",336:"Vatican City",862:"Venezuela",704:"Vietnam",
+    092:"British Virgin Islands",850:"US Virgin Islands",
+    10:"Antarctica",876:"Wallis and Futuna",732:"Western Sahara",887:"Yemen",
+    894:"Zambia",716:"Zimbabwe",
+  };
+}
+
+function initLayers(geojson) {
+  allFeatures = geojson.features;
+
+  geoJsonLayer = L.geoJSON(geojson, {
+    style: defaultStyle,
+    onEachFeature: onEachFeature,
+  }).addTo(map);
+
+  // Allow tile layer to repeat across longitude
+  map.setMaxBounds(null);
+
+  // Force Leaflet to remeasure container — critical on iOS where
+  // the map div may have been 0px tall during initial render
+  setTimeout(() => map.invalidateSize(), 100);
+
+  // Restore saved session if exists
+  const saved = localStorage.getItem('countries-visited-session');
+  if (saved) {
+    try {
+      const data = JSON.parse(saved);
+      if (data.visited) {
+        Object.entries(data.visited).forEach(([name, color]) => {
+          const layer = findLayerByName(name);
+          if (layer) highlightCountry(layer, name, color, false);
+        });
+        if (data.color) document.getElementById('colorPicker').value = data.color;
+        showToast('Session restored ✓');
+        setTimeout(hideToast, 2000);
+      }
+    } catch(e) {}
+  }
+}
+
+function defaultStyle(feature) {
+  const name = feature.properties.name;
+  if (visited[name]) {
+    return {
+      fillColor: visited[name].color,
+      fillOpacity: 0.65,
+      color: '#ffffff',
+      weight: 0.8,
+      opacity: 0.7,
+    };
+  }
+  return {
+    fillColor: '#2a3550',
+    fillOpacity: 0.7,
+    color: '#3d4d6e',
+    weight: 0.8,
+    opacity: 0.8,
+  };
+}
+
+function onEachFeature(feature, layer) {
+  const name = feature.properties.name;
+  const isTouch = () => window.matchMedia('(hover: none)').matches;
+
+  layer.on({
+    mouseover(e) {
+      if (isTouch()) return; // skip hover effects on touch
+      const l = e.target;
+      if (!visited[name]) {
+        l.setStyle({ fillColor: '#3d5a8a', fillOpacity: 0.8 });
+      } else {
+        l.setStyle({ fillOpacity: 0.85, weight: 2 });
+      }
+      l.bindTooltip(name, { sticky: true, className: '' }).openTooltip();
+    },
+    mouseout(e) {
+      if (isTouch()) return;
+      geoJsonLayer.resetStyle(e.target);
+      e.target.closeTooltip();
+    },
+    click(e) {
+      // Show tooltip on touch
+      if (isTouch()) {
+        const l = e.target;
+        l.bindTooltip(name, { sticky: false, className: '' }).openTooltip();
+        setTimeout(() => l.closeTooltip(), 1500);
+      }
+      if (visited[name]) {
+        removeCountry(name);
+      } else {
+        const color = document.getElementById('colorPicker').value;
+        highlightCountry(layer, name, color, true);
+      }
+    }
+  });
+}
+
+function highlightCountry(layer, name, color, updateList) {
+  visited[name] = { color, layer };
+  layer.setStyle({
+    fillColor: color,
+    fillOpacity: 0.65,
+    color: '#ffffff',
+    weight: 1.2,
+    opacity: 0.9,
+  });
+  if (updateList) renderList();
+}
+
+function removeCountry(name) {
+  if (visited[name]) {
+    const layer = visited[name].layer;
+    delete visited[name];
+    geoJsonLayer.resetStyle(layer);
+    renderList();
+  }
+}
+
+function findLayerByName(name) {
+  let found = null;
+  geoJsonLayer.eachLayer(l => {
+    if (l.feature && l.feature.properties.name === name) found = l;
+  });
+  return found;
+}
+
+function renderList() {
+  const list = document.getElementById('countryList');
+  const names = Object.keys(visited).sort();
+  document.getElementById('counter').textContent = names.length;
+
+  if (names.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <span class="icon">🌍</span>
+      No countries selected yet.<br>Click any country on the map to get started.
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = names.map(name => `
+    <div class="country-item" onclick="flyToCountry('${name.replace(/'/g,"\\'")}')">
+      <div class="country-swatch" style="background:${visited[name].color}"></div>
+      <span class="country-name">${name}</span>
+      <span class="country-remove" onclick="event.stopPropagation(); removeCountry('${name.replace(/'/g,"\\'")}')">✕</span>
+    </div>
+  `).join('');
+}
+
+function flyToCountry(name) {
+  const layer = visited[name]?.layer;
+  if (layer) {
+    map.flyToBounds(layer.getBounds(), { duration: 0.8, padding: [40, 40] });
+  }
+}
+
+function clearAll() {
+  if (Object.keys(visited).length === 0) return;
+  if (!confirm('Clear all highlighted countries?')) return;
+  const names = Object.keys(visited);
+  names.forEach(name => {
+    const layer = visited[name].layer;
+    delete visited[name];
+    if (geoJsonLayer) geoJsonLayer.resetStyle(layer);
+  });
+  renderList();
+}
+
+function saveSession() {
+  const data = {
+    visited: {},
+    color: document.getElementById('colorPicker').value,
+    savedAt: new Date().toISOString(),
+  };
+  Object.entries(visited).forEach(([name, v]) => {
+    data.visited[name] = v.color;
+  });
+  localStorage.setItem('countries-visited-session', JSON.stringify(data));
+
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+
+  // iOS Safari: use FileReader to convert to data URL since createObjectURL download is unreliable
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  if (isIOS) {
+    const reader = new FileReader();
+    reader.onload = function() {
+      const a = document.createElement('a');
+      a.href = reader.result;
+      a.download = 'countries-visited.json';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => document.body.removeChild(a), 300);
+    };
+    reader.readAsDataURL(blob);
+  } else {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'countries-visited.json';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 200);
+  }
+
+  showToast('Session saved ✓');
+  setTimeout(hideToast, 2000);
+}
+
+function loadSession() {
+  // Must use a persistent input element for iOS compatibility
+  let input = document.getElementById('_fileInput');
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.id = '_fileInput';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+  }
+  // Reset so same file can be reloaded
+  input.value = '';
+  input.onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!data.visited) throw new Error('Invalid file');
+
+        Object.entries(visited).forEach(([name, v]) => {
+          if (geoJsonLayer) geoJsonLayer.resetStyle(v.layer);
+        });
+        Object.keys(visited).forEach(k => delete visited[k]);
+
+        Object.entries(data.visited).forEach(([name, color]) => {
+          const layer = findLayerByName(name);
+          if (layer) highlightCountry(layer, name, color, false);
+        });
+        if (data.color) {
+          document.getElementById('colorPicker').value = data.color;
+          setActiveSwatchColor(data.color);
+        }
+        renderList();
+        showToast('Session loaded ✓');
+        setTimeout(hideToast, 2000);
+      } catch(e) {
+        showToast('Invalid session file.');
+        setTimeout(hideToast, 2000);
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+// ─── COLOR SWATCHES ───────────────────────────────────────────────────────────
+function initSwatches() {
+  const swatches = document.querySelectorAll('.color-swatch');
+  swatches.forEach(swatch => {
+    swatch.addEventListener('click', () => {
+      swatches.forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+      document.getElementById('colorPicker').value = swatch.dataset.color;
+    });
+  });
+}
+
+function setActiveSwatchColor(hex) {
+  const swatches = document.querySelectorAll('.color-swatch');
+  let matched = false;
+  swatches.forEach(s => {
+    s.classList.remove('active');
+    if (s.dataset.color.toLowerCase() === hex.toLowerCase()) {
+      s.classList.add('active');
+      matched = true;
+    }
+  });
+  // If no swatch matches, just leave none active
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.opacity = '1';
+}
+function hideToast() {
+  document.getElementById('toast').style.opacity = '0';
+}
+
+// ─── START ────────────────────────────────────────────────────────────────────
+// Expose functions used by inline onclick attributes to global scope
+window.clearAll = clearAll;
+window.loadSession = loadSession;
+window.saveSession = saveSession;
+window.flyToCountry = flyToCountry;
+window.removeCountry = removeCountry;
+
+initSwatches();
+init();
+
+// Hide initial toast after 3s
+setTimeout(hideToast, 3000);
+
+}); // end DOMContentLoaded
+</script>
+</body>
+</html>
