@@ -1,0 +1,2310 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+===================================================================================
+CLAUDE DEVELOPER NOTES — Countries Visited App
+Last updated: 2026-03-08
+===================================================================================
+
+OVERVIEW:
+  Single-file HTML app hosted on GitHub Pages. No build step, no server.
+  Leaflet.js for the map, CartoDB dark tiles (no API key needed).
+  world-atlas@2 TopoJSON loaded from jsDelivr CDN at runtime.
+  topojson-client@3 loaded from cdnjs CDN at runtime.
+  JSONBin.io for cloud save/load — users get a personal save code (bin ID).
+
+ARCHITECTURE:
+  - Map init: Leaflet, worldCopyJump:true for infinite horizontal panning
+  - GeoJSON: TopoJSON → GeoJSON via topojson.feature(), then fixAntimeridian()
+  - Country names: static ISO 3166-1 numeric → name map in getCountryNames()
+  - State: visited{} object: { countryName: { color, layer } }
+  - Sidebar: alphabetically sorted list, click to fly-to, ✕ to remove
+  - Counter: live count of selected countries in header
+
+CLOUD SAVE (JSONBin.io):
+  - API key: scoped Access Key (create/read/update only, no delete, no account access)
+  - JSONBIN_KEY constant at top of script — replace if key is rotated
+  - JSONBIN_API: https://api.jsonbin.io/v3/b
+  - First save: POST creates a new bin → returns bin ID (save code shown to user)
+  - Subsequent saves: PUT updates the existing bin
+  - Load: GET fetches bin by ID
+  - Bin ID stored in localStorage under 'countries-visited-bin-id'
+  - Save data format: { visited: { countryName: hexColor }, color: hex, savedAt: ISO }
+  - Bins are private by default (X-Bin-Private: true on create)
+  - Save code modal: shown after first save, dismissible, copyable
+
+KEY FIXES ALREADY APPLIED:
+  1. ANTIMERIDIAN: Russia, Fiji, Kiribati, Alaska — fixAntimeridian() unwraps rings.
+  2. BLANK PAGE ON SAVE: <a> appended to body before .click(), removed after 200ms.
+  3. BELIZE etc: filter removed, unknown IDs show as "Region <id>".
+  4. WORLD WRAP: worldCopyJump:true + setMaxBounds(null) after GeoJSON loads.
+  5. iOS COMPATIBILITY: color swatches, touch events, persistent file input,
+     FileReader download, remove button always visible, responsive layout,
+     DOMContentLoaded deferral, min-height:0 flex fix, invalidateSize().
+  6. MAP DATA LOADING: XHR instead of fetch(), topojson in <head> <script> tag.
+
+CLICK BEHAVIOR:
+  - Click/tap unvisited country → highlight with current color swatch color
+  - Click/tap visited country → deselect
+  - Click country in sidebar → fly to it on map
+  - ✕ in sidebar → remove country
+
+COLOR SWATCHES:
+  - 6 preset colors as .color-swatch divs. Hidden #colorPicker input keeps state.
+  - To add colors: add <div class="color-swatch" style="background:#hex" data-color="#hex">
+
+FONTS: Playfair Display (headings), DM Sans (body) — Google Fonts
+TILE LAYER: CartoDB dark_nolabels, no API key required
+===================================================================================
+-->
+
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Countries Visited</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #181c27;
+    --border: #2a2f42;
+    --accent: #c9a84c;
+    --accent2: #e8c96d;
+    --text: #e8e4d9;
+    --text-muted: #7a7f94;
+    --highlight: #c9a84c33;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+  }
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    /* 100vh includes browser chrome on iOS — use fill-available as fix */
+    height: 100vh;
+    height: -webkit-fill-available;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* HEADER */
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    z-index: 1000;
+  }
+  .header-left {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  header h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--accent2);
+    letter-spacing: 0.02em;
+  }
+  .counter {
+    background: var(--accent);
+    color: #0f1117;
+    font-family: 'Playfair Display', serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .counter-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-weight: 300;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  /* CATEGORY PICKER */
+  .category-picker {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+  }
+  .cat-slot {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    -webkit-tap-highlight-color: transparent;
+    min-width: 0;
+    max-width: 110px;
+  }
+  .cat-slot:hover { border-color: var(--accent); }
+  .cat-slot.active {
+    border-color: var(--accent2);
+    background: rgba(201,168,76,0.12);
+  }
+  .cat-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .cat-name {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 72px;
+  }
+  .cat-slot.active .cat-name { color: var(--accent2); }
+  .btn-wtv {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  .btn-wtv.active {
+    border-color: #5b8dd9;
+    color: #5b8dd9;
+    background: rgba(91,141,217,0.12);
+  }
+  /* Category edit popover */
+  .cat-popover {
+    position: fixed;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    z-index: 9999;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    min-width: 190px;
+  }
+  .cat-popover-title {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+  .cat-popover input[type="text"] {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 0.8rem;
+    color: var(--text);
+    font-family: inherit;
+    box-sizing: border-box;
+    outline: none;
+    margin-bottom: 8px;
+  }
+  .cat-popover input[type="text"]:focus { border-color: var(--accent); }
+  .cat-popover-colors {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  .cat-popover-swatch {
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: transform 0.1s, border-color 0.1s;
+  }
+  .cat-popover-swatch.active { border-color: #fff; transform: scale(1.2); }
+  .cat-popover-actions { display: flex; gap: 6px; }
+  /* Want to Visit sidebar section */
+  .wtv-section-header {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #5b8dd9;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 8px 18px 4px;
+    border-top: 1px solid var(--border);
+  }
+  .wtv-item .country-swatch {
+    border: 1.5px dashed rgba(91,141,217,0.7) !important;
+    background: transparent !important;
+  }
+  input[type="color"] {
+    width: 32px; height: 28px;
+    border: none; border-radius: 4px;
+    cursor: pointer; background: none; padding: 0;
+  }
+
+  .btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent2); }
+  .btn-primary {
+    background: var(--accent);
+    color: #0f1117;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .btn-primary:hover { background: var(--accent2); border-color: var(--accent2); color: #0f1117; }
+
+  /* MAIN LAYOUT */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    /* iOS Safari needs min-height:0 or flex children won't shrink correctly */
+    min-height: 0;
+  }
+
+  /* MAP */
+  .map-wrap {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+  #map {
+    flex: 1;
+    min-height: 0;
+    background: #1a2035;
+  }
+  .bottom-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+    z-index: 500;
+  }
+  .code-display {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 12px;
+    flex: 1;
+    min-width: 0;
+  }
+  .code-display-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .code-display-value {
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: var(--accent2);
+    letter-spacing: 0.04em;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .code-display-copy {
+    flex-shrink: 0;
+    padding: 3px 8px;
+    font-size: 0.7rem;
+  }
+  .leaflet-container { background: #1a2035; }
+  .leaflet-control-zoom a {
+    background: var(--panel) !important;
+    color: var(--text) !important;
+    border-color: var(--border) !important;
+  }
+  .leaflet-control-zoom a:hover { background: var(--border) !important; }
+  .leaflet-control-attribution { display: none; }
+
+  /* SIDEBAR */
+  .sidebar {
+    width: 260px;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    flex-shrink: 0;
+    min-height: 0;
+  }
+  /* On small screens, sidebar moves below the map */
+  @media (max-width: 600px) {
+    .main { flex-direction: column; }
+    .sidebar {
+      width: 100%;
+      border-left: none;
+      border-top: 1px solid var(--border);
+      height: 280px;
+      flex-shrink: 0;
+    }
+    header { padding: 0 12px; height: auto; min-height: 56px; flex-wrap: wrap; gap: 6px; padding-top: 6px; padding-bottom: 6px; }
+    header h1 { font-size: 1.2rem; }
+    .header-right { gap: 6px; flex-wrap: wrap; }
+    .btn { padding: 5px 10px; font-size: 0.72rem; }
+    .cat-name { display: none; }
+    .map-wrap { min-height: 0; flex: 1; }
+    .code-display-label { display: none; }
+    .btn-wtv { font-size: 0.65rem; padding: 4px 7px; }
+  }
+  .sidebar-header {
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    position: relative;
+  }
+  .sidebar-header h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: 1rem;
+    color: var(--accent2);
+    font-weight: 700;
+  }
+  .sidebar-header p {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+  .country-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+  .country-list::-webkit-scrollbar { width: 4px; }
+  .country-list::-webkit-scrollbar-track { background: transparent; }
+  .country-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .country-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 18px;
+    transition: background 0.1s;
+    cursor: pointer;
+  }
+  .country-item:hover { background: var(--highlight); }
+  .country-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.15);
+  }
+  .country-name {
+    font-size: 0.82rem;
+    flex: 1;
+  }
+  .country-cat-tag {
+    font-size: 0.62rem;
+    border: 1px solid;
+    border-radius: 4px;
+    padding: 1px 5px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-weight: 500;
+  }
+  .visit-controls {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+  .visit-btn {
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+    transition: border-color 0.1s, color 0.1s;
+  }
+  .visit-btn:hover { border-color: var(--accent); color: var(--accent2); }
+  .visit-count {
+    font-size: 0.72rem;
+    font-family: 'Playfair Display', serif;
+    color: var(--accent2);
+    min-width: 22px;
+    text-align: center;
+    font-weight: 700;
+  }
+  .country-remove {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.1s;
+    padding: 2px 4px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .country-item:hover .country-remove { opacity: 1; }
+  /* Always show remove on touch devices */
+  @media (hover: none) {
+    .country-remove { opacity: 0.6; }
+  }
+  .country-remove:hover { background: #ff4d4d33; color: #ff6b6b; }
+  .empty-state {
+    padding: 32px 18px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    line-height: 1.6;
+  }
+  .empty-state .icon {
+    font-size: 2rem;
+    margin-bottom: 10px;
+    display: block;
+    opacity: 0.5;
+  }
+
+  /* TOOLTIP */
+  .leaflet-tooltip {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.78rem;
+    border-radius: 6px;
+    padding: 4px 10px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .leaflet-tooltip-top:before { border-top-color: var(--border); }
+
+  /* INSTRUCTIONS TOAST */
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    padding: 8px 16px;
+    border-radius: 20px;
+    z-index: 9999;
+    pointer-events: none;
+    transition: opacity 0.5s;
+    white-space: nowrap;
+    max-width: 90vw;
+    white-space: normal;
+    text-align: center;
+  }
+  /* STATS PANEL */
+  .stats-panel {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 18px 16px;
+    flex-shrink: 0;
+    background: var(--panel);
+  }
+  .stats-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 7px;
+  }
+  .stats-pct {
+    font-family: 'Playfair Display', serif;
+    font-size: 1rem;
+    color: var(--accent2);
+    font-weight: 700;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .stats-bar-track {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .stats-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+  .stats-continents {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .stat-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.74rem;
+  }
+  .stat-continent {
+    color: var(--text-muted);
+    width: 80px;
+    flex-shrink: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stat-mini-track {
+    flex: 1;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .stat-mini-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.4s ease;
+  }
+  .stat-fraction {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    width: 28px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+  /* MODAL */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 10000;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 28px 24px 22px;
+    width: 100%;
+    max-width: 380px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  .modal-title {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.2rem;
+    color: var(--accent2);
+    font-weight: 700;
+    margin-bottom: 10px;
+  }
+  .modal-body {
+    font-size: 0.83rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin-bottom: 16px;
+  }
+  .save-code-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+  }
+  .save-code {
+    font-family: monospace;
+    font-size: 1rem;
+    color: var(--accent2);
+    letter-spacing: 0.05em;
+    flex: 1;
+    word-break: break-all;
+  }
+  .btn-copy {
+    flex-shrink: 0;
+    padding: 4px 10px;
+    font-size: 0.72rem;
+  }
+  .modal-hint {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    opacity: 0.7;
+    margin-bottom: 18px;
+    line-height: 1.4;
+  }
+  .modal-close { width: 100%; justify-content: center; }
+  .code-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: monospace;
+    font-size: 0.95rem;
+    padding: 10px 14px;
+    outline: none;
+    margin-bottom: 8px;
+    letter-spacing: 0.04em;
+  }
+  .code-input:focus { border-color: var(--accent); }
+  .cursor-label {
+    position: fixed;
+    pointer-events: none;
+    z-index: 9999;
+    background: rgba(15, 20, 35, 0.92);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 0.78rem;
+    color: #e8c96d !important;
+    font-family: 'Playfair Display', serif;
+    font-weight: 700;
+    white-space: nowrap;
+    opacity: 0;
+    transform: translate(14px, -50%);
+    transition: opacity 0.15s;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .cursor-label.visible {
+    opacity: 1;
+  }
+  /* SEARCH */
+  .search-wrap {
+    position: relative;
+    margin-top: 10px;
+  }
+  .search-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 30px 7px 12px;
+    font-size: 0.82rem;
+    color: var(--text);
+    font-family: inherit;
+    box-sizing: border-box;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .search-input::placeholder { color: var(--text-muted); }
+  .search-clear {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+  }
+  .search-clear:hover { color: var(--text); }
+  .search-results {
+    position: absolute;
+    left: 0; right: 0;
+    top: calc(100% + 4px);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    z-index: 2000;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .search-result-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .search-result-item:hover,
+  .search-result-item.active { background: var(--highlight); }
+  .search-result-item:first-child { border-radius: 8px 8px 0 0; }
+  .search-result-item:last-child { border-radius: 0 0 8px 8px; }
+  .search-result-swatch {
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  .search-result-name { flex: 1; }
+  .search-result-badge {
+    font-size: 0.68rem;
+    color: var(--accent2);
+    background: rgba(201,168,76,0.15);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .search-no-results {
+    padding: 12px 14px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>Countries Visited</h1>
+    <div class="counter" id="counter">0</div>
+    <span class="counter-label">countries</span>
+  </div>
+  <div class="header-right">
+    <div class="category-picker" id="categoryPicker"></div>
+    <button class="btn btn-wtv" id="wtvBtn" onclick="toggleWtvMode()" title="Want to Visit mode">🧭 Want to Visit</button>
+    <button class="btn" onclick="clearAll()">Clear All</button>
+    <!-- Hidden input kept for JS compatibility -->
+    <input type="color" id="colorPicker" value="#c9a84c" style="display:none">
+  </div>
+</header>
+
+<div class="main">
+  <div class="map-wrap">
+    <div id="map"></div>
+    <div class="bottom-bar">
+      <button class="btn btn-primary" id="saveBtn" onclick="saveToCloud()">Save</button>
+      <button class="btn" onclick="showLoadModal()">Load</button>
+      <button class="btn" onclick="shareAsImage()">⬇ Export Map</button>
+      <div class="code-display" id="codeDisplay" style="display:none">
+        <span class="code-display-label">Your code:</span>
+        <span class="code-display-value" id="codeDisplayValue"></span>
+        <button class="btn btn-copy code-display-copy" onclick="copySaveCode()">Copy</button>
+      </div>
+    </div>
+  </div>
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h2>Visited Countries</h2>
+      <p>Click a country on the map to add it</p>
+      <div class="search-wrap">
+        <input type="text" id="countrySearch" class="search-input" placeholder="Search or jump to country…" autocomplete="off" oninput="onSearchInput()" onkeydown="onSearchKey(event)">
+        <button class="search-clear" id="searchClear" onclick="clearSearch()" style="display:none">✕</button>
+      </div>
+      <div class="search-results" id="searchResults" style="display:none"></div>
+    </div>
+    <div class="stats-panel" id="statsPanel">
+      <div class="stats-header">
+        <span id="statsCoverageLabel">World Coverage</span>
+        <span class="stats-pct" id="statsPct">0%</span>
+      </div>
+      <div class="stats-bar-track"><div class="stats-bar-fill" id="statsBarFill"></div></div>
+      <div class="stats-continents" id="statsContinents"></div>
+    </div>
+    <div class="country-list" id="countryList">
+      <div class="empty-state">
+        <span class="icon">🌍</span>
+        No countries selected yet.<br>Click any country on the map to get started.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast">Click any country to highlight it</div>
+<div class="cursor-label" id="cursorLabel"></div>
+
+<!-- SAVE CODE MODAL -->
+<div class="modal-overlay" id="saveModal" onclick="closeSaveModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title">✓ Saved to Cloud</div>
+    <div class="modal-body">
+      Your map has been saved. Use this code on any device to load it back:
+    </div>
+    <div class="save-code-wrap">
+      <span class="save-code" id="saveCodeDisplay"></span>
+      <button class="btn btn-copy" id="copyBtn" onclick="copySaveCode()">Copy</button>
+    </div>
+    <div class="modal-hint">Keep this code somewhere safe — it's how you access your map from any device.</div>
+    <button class="btn btn-primary modal-close" onclick="closeSaveModal()">Got it</button>
+  </div>
+</div>
+
+<!-- LOAD MODAL -->
+<div class="modal-overlay" id="loadModal" onclick="closeLoadModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title">Load Your Map</div>
+    <div class="modal-body">Enter your save code to restore your map on this device:</div>
+    <input class="code-input" id="loadCodeInput" type="text" placeholder="e.g. 64a3f28b9c1d2e" maxlength="32" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <div class="modal-error" id="loadError"></div>
+    <div style="display:flex;gap:10px;margin-top:4px;">
+      <button class="btn" style="flex:1" onclick="closeLoadModal()">Cancel</button>
+      <button class="btn btn-primary" style="flex:1" onclick="loadFromCloud()">Load</button>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+
+// ─── JSONBIN CONFIG ───────────────────────────────────────────────────────────
+const JSONBIN_KEY = '$2a$10$CuZzbzNB7lx2wmvE5nJjKu6EgDva1/kqR0cO7UIAgfSIpgs4WMNsW';
+const JSONBIN_API = 'https://api.jsonbin.io/v3/b';
+
+// ─── COOKIE HELPERS ───────────────────────────────────────────────────────────
+function setCookie(name, value, days) {
+  const expires = new Date(Date.now() + days * 864e5).toUTCString();
+  document.cookie = `${name}=${encodeURIComponent(value)};expires=${expires};path=/;SameSite=Lax`;
+}
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+// ─── BOTTOM BAR CODE DISPLAY ──────────────────────────────────────────────────
+function showCodeInBar(binId) {
+  const display = document.getElementById('codeDisplay');
+  document.getElementById('codeDisplayValue').textContent = binId;
+  display.style.display = 'flex';
+}
+
+function initCodeBar() {
+  // On load, show the code in the bar if we already have one stored
+  const stored = currentBinId;
+  if (stored) showCodeInBar(stored);
+}
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+const visited = {}; // { countryName: { color, layer } }
+let geoJsonLayer = null;
+let allFeatures = [];
+let currentBinId = localStorage.getItem('countries-visited-bin-id') || getCookie('countries-visited-bin-id') || null;
+
+// ─── MAP INIT ─────────────────────────────────────────────────────────────────
+// Deferred until DOMContentLoaded so #map has a real pixel size before Leaflet measures it.
+// On iOS WebKit, inline script execution can precede layout, giving Leaflet a 0×0 container.
+const map = L.map('map', {
+  center: [20, 0],
+  zoom: 2,
+  minZoom: 2,
+  maxZoom: 10,
+  zoomControl: true,
+  worldCopyJump: true,
+  doubleClickZoom: false,
+});
+
+// Natural Earth tile — open source, no API key
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+  attribution: '© OpenStreetMap, © CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19,
+  crossOrigin: 'anonymous',
+}).addTo(map);
+
+// ─── ANTIMERIDIAN FIX ────────────────────────────────────────────────────────
+// Splits polygons that cross the antimeridian (±180°) so Leaflet renders them correctly.
+// Affects Russia, Fiji, USA (Alaska), Kiribati, etc.
+function fixAntimeridian(geojson) {
+  geojson.features = geojson.features.map(feature => {
+    if (!feature.geometry) return feature;
+    const type = feature.geometry.type;
+    if (type === 'Polygon') {
+      feature.geometry.coordinates = feature.geometry.coordinates.map(ring => fixRing(ring));
+    } else if (type === 'MultiPolygon') {
+      feature.geometry.coordinates = feature.geometry.coordinates.map(poly =>
+        poly.map(ring => fixRing(ring))
+      );
+    }
+    return feature;
+  });
+  return geojson;
+}
+
+function fixRing(ring) {
+  // Unwrap longitudes so that consecutive points never jump more than 180°
+  const fixed = [ring[0].slice()];
+  for (let i = 1; i < ring.length; i++) {
+    const prev = fixed[i - 1];
+    const curr = ring[i].slice();
+    let lng = curr[0];
+    const prevLng = prev[0];
+    // Adjust longitude to be within 180° of the previous point
+    while (lng - prevLng > 180) lng -= 360;
+    while (prevLng - lng > 180) lng += 360;
+    curr[0] = lng;
+    fixed.push(curr);
+  }
+  return fixed;
+}
+
+async function init() {
+  showToast('Loading map data…');
+  try {
+    // topojson loaded via <script> tag in <head> — no dynamic load needed
+
+    // Use XMLHttpRequest instead of fetch() — more reliable on iOS when
+    // opening as a local file:// URL, which can block fetch() to CDNs
+    const topo = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json');
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); }
+          catch(e) { reject(new Error('JSON parse failed: ' + e.message)); }
+        } else {
+          reject(new Error('HTTP ' + xhr.status + ' loading map data'));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error loading map data — check connection'));
+      xhr.ontimeout = () => reject(new Error('Timeout loading map data'));
+      xhr.timeout = 15000;
+      xhr.send();
+    });
+
+    // Convert to GeoJSON
+    const geojson = topojson.feature(topo, topo.objects.countries);
+
+    // Fix antimeridian artifacts (Russia, Fiji, etc.)
+    fixAntimeridian(geojson);
+
+    // Country names
+    const nameMap = await getCountryNames();
+
+    geojson.features.forEach(f => {
+      f.properties = f.properties || {};
+      const name = nameMap[parseInt(f.id)];
+      f.properties.name = name || ('Region ' + f.id);
+    });
+
+    initLayers(geojson);
+    hideToast();
+  } catch(e) {
+    console.error(e);
+    // Show the actual error message so it's diagnosable
+    const t = document.getElementById('toast');
+    t.classList.add('error');
+    showToast('Map error: ' + e.message);
+  }
+}
+
+async function getCountryNames() {
+  // Complete ISO 3166-1 numeric → name map
+  // Covers every feature ID present in world-atlas countries-50m.json
+  return {
+    4:"Afghanistan",8:"Albania",12:"Algeria",16:"American Samoa",
+    20:"Andorra",24:"Angola",660:"Anguilla",28:"Antigua and Barbuda",
+    32:"Argentina",51:"Armenia",533:"Aruba",36:"Australia",40:"Austria",
+    31:"Azerbaijan",44:"Bahamas",48:"Bahrain",50:"Bangladesh",52:"Barbados",
+    112:"Belarus",56:"Belgium",84:"Belize",204:"Benin",60:"Bermuda",
+    64:"Bhutan",68:"Bolivia",70:"Bosnia and Herzegovina",72:"Botswana",
+    76:"Brazil",96:"Brunei",100:"Bulgaria",854:"Burkina Faso",108:"Burundi",
+    132:"Cape Verde",116:"Cambodia",120:"Cameroon",124:"Canada",136:"Cayman Islands",
+    140:"Central African Republic",148:"Chad",152:"Chile",156:"China",
+    162:"Christmas Island",166:"Cocos Islands",170:"Colombia",174:"Comoros",
+    178:"Republic of the Congo",180:"Dem. Rep. Congo",184:"Cook Islands",
+    188:"Costa Rica",191:"Croatia",192:"Cuba",531:"Curaçao",196:"Cyprus",
+    203:"Czech Republic",208:"Denmark",262:"Djibouti",212:"Dominica",
+    214:"Dominican Republic",218:"Ecuador",818:"Egypt",222:"El Salvador",
+    226:"Equatorial Guinea",232:"Eritrea",233:"Estonia",231:"Ethiopia",
+    238:"Falkland Islands",234:"Faroe Islands",242:"Fiji",246:"Finland",
+    250:"France",254:"French Guiana",258:"French Polynesia",
+    260:"French Southern Territories",266:"Gabon",270:"Gambia",268:"Georgia",
+    276:"Germany",288:"Ghana",292:"Gibraltar",300:"Greece",304:"Greenland",
+    308:"Grenada",312:"Guadeloupe",316:"Guam",320:"Guatemala",324:"Guinea",
+    624:"Guinea-Bissau",328:"Guyana",332:"Haiti",340:"Honduras",344:"Hong Kong",
+    348:"Hungary",352:"Iceland",356:"India",360:"Indonesia",364:"Iran",
+    368:"Iraq",372:"Ireland",376:"Israel",380:"Italy",388:"Jamaica",
+    392:"Japan",400:"Jordan",398:"Kazakhstan",404:"Kenya",296:"Kiribati",
+    414:"Kuwait",417:"Kyrgyzstan",418:"Laos",428:"Latvia",422:"Lebanon",
+    426:"Lesotho",430:"Liberia",434:"Libya",438:"Liechtenstein",440:"Lithuania",
+    442:"Luxembourg",446:"Macao",807:"North Macedonia",450:"Madagascar",
+    454:"Malawi",458:"Malaysia",462:"Maldives",466:"Mali",470:"Malta",
+    584:"Marshall Islands",474:"Martinique",478:"Mauritania",480:"Mauritius",
+    175:"Mayotte",484:"Mexico",583:"Micronesia",498:"Moldova",492:"Monaco",
+    496:"Mongolia",499:"Montenegro",500:"Montserrat",504:"Morocco",
+    508:"Mozambique",104:"Myanmar",516:"Namibia",520:"Nauru",524:"Nepal",
+    528:"Netherlands",540:"New Caledonia",554:"New Zealand",558:"Nicaragua",
+    562:"Niger",566:"Nigeria",570:"Niue",574:"Norfolk Island",
+    408:"North Korea",580:"Northern Mariana Islands",578:"Norway",512:"Oman",
+    586:"Pakistan",585:"Palau",275:"Palestine",591:"Panama",
+    598:"Papua New Guinea",600:"Paraguay",604:"Peru",608:"Philippines",
+    612:"Pitcairn",616:"Poland",620:"Portugal",630:"Puerto Rico",634:"Qatar",
+    638:"Réunion",642:"Romania",643:"Russia",646:"Rwanda",
+    652:"Saint Barthélemy",654:"Saint Helena",659:"Saint Kitts and Nevis",
+    662:"Saint Lucia",663:"Saint Martin",666:"Saint Pierre and Miquelon",
+    670:"Saint Vincent and the Grenadines",882:"Samoa",674:"San Marino",
+    678:"Sao Tome and Principe",682:"Saudi Arabia",686:"Senegal",688:"Serbia",
+    690:"Seychelles",694:"Sierra Leone",703:"Slovakia",705:"Slovenia",
+    90:"Solomon Islands",706:"Somalia",710:"South Africa",239:"South Georgia",
+    410:"South Korea",728:"South Sudan",724:"Spain",144:"Sri Lanka",
+    729:"Sudan",740:"Suriname",748:"Eswatini",752:"Sweden",756:"Switzerland",
+    760:"Syria",158:"Taiwan",762:"Tajikistan",834:"Tanzania",764:"Thailand",
+    626:"Timor-Leste",768:"Togo",776:"Tonga",780:"Trinidad and Tobago",
+    788:"Tunisia",792:"Turkey",795:"Turkmenistan",796:"Turks and Caicos Islands",
+    798:"Tuvalu",800:"Uganda",804:"Ukraine",784:"United Arab Emirates",
+    826:"United Kingdom",840:"United States",858:"Uruguay",860:"Uzbekistan",
+    548:"Vanuatu",336:"Vatican City",862:"Venezuela",704:"Vietnam",
+    092:"British Virgin Islands",850:"US Virgin Islands",
+    10:"Antarctica",876:"Wallis and Futuna",732:"Western Sahara",887:"Yemen",
+    894:"Zambia",716:"Zimbabwe",
+  };
+}
+
+function getCountryContinent() {
+  // ISO 3166-1 numeric → continent
+  // 7 continents: Africa, Asia, Europe, North America, South America, Oceania, Antarctica
+  return {
+    4:"Asia",8:"Europe",12:"Africa",16:"Oceania",20:"Europe",24:"Africa",
+    28:"North America",32:"South America",36:"Oceania",40:"Europe",31:"Asia",
+    44:"North America",48:"Asia",50:"Asia",51:"Asia",52:"North America",
+    56:"Europe",64:"Asia",68:"South America",70:"Europe",72:"Africa",
+    76:"South America",84:"North America",90:"Oceania",96:"Asia",100:"Europe",
+    104:"Asia",108:"Africa",112:"Europe",116:"Asia",120:"Africa",124:"North America",
+    132:"Africa",136:"North America",140:"Africa",144:"Asia",148:"Africa",
+    152:"South America",156:"Asia",158:"Asia",162:"Asia",166:"Asia",
+    170:"South America",174:"Africa",175:"Africa",178:"Africa",180:"Africa",
+    184:"Oceania",188:"North America",191:"Europe",192:"North America",
+    196:"Europe",203:"Europe",204:"Africa",208:"Europe",212:"North America",
+    214:"North America",218:"South America",222:"North America",226:"Africa",
+    231:"Africa",232:"Africa",233:"Europe",234:"Europe",238:"South America",
+    239:"Antarctica",242:"Oceania",246:"Europe",250:"Europe",254:"South America",
+    258:"Oceania",260:"Antarctica",262:"Africa",266:"Africa",268:"Asia",
+    270:"Africa",275:"Asia",276:"Europe",288:"Africa",292:"Europe",
+    296:"Oceania",300:"Europe",304:"North America",308:"North America",
+    312:"North America",316:"Oceania",320:"North America",324:"Africa",
+    328:"South America",332:"North America",336:"Europe",340:"North America",
+    344:"Asia",348:"Europe",350:"Europe",352:"Europe",356:"Asia",360:"Asia",
+    364:"Asia",368:"Asia",372:"Europe",376:"Asia",380:"Europe",388:"North America",
+    392:"Asia",398:"Asia",400:"Asia",404:"Africa",408:"Asia",410:"Asia",
+    414:"Asia",417:"Asia",418:"Asia",422:"Asia",426:"Africa",428:"Europe",
+    430:"Africa",434:"Africa",438:"Europe",440:"Europe",442:"Europe",
+    446:"Asia",450:"Africa",454:"Africa",458:"Asia",462:"Asia",466:"Africa",
+    470:"Europe",474:"North America",478:"Africa",480:"Africa",484:"North America",
+    492:"Europe",496:"Asia",498:"Europe",499:"Europe",500:"North America",
+    504:"Africa",508:"Africa",512:"Asia",516:"Africa",520:"Oceania",
+    524:"Asia",528:"Europe",531:"North America",533:"North America",
+    540:"Oceania",548:"Oceania",554:"Oceania",558:"North America",
+    562:"Africa",566:"Africa",570:"Oceania",574:"Oceania",578:"Europe",
+    580:"Oceania",583:"Oceania",584:"Oceania",585:"Oceania",586:"Asia",
+    591:"North America",598:"Oceania",600:"South America",604:"South America",
+    608:"Asia",612:"Oceania",616:"Europe",620:"Europe",624:"Africa",
+    626:"Asia",630:"North America",634:"Asia",638:"Africa",642:"Europe",
+    643:"Europe",646:"Africa",652:"North America",654:"Africa",659:"North America",
+    662:"North America",663:"North America",666:"North America",670:"North America",
+    674:"Europe",678:"Africa",682:"Asia",686:"Africa",688:"Europe",
+    690:"Africa",694:"Africa",703:"Europe",705:"Europe",706:"Africa",
+    710:"Africa",716:"Africa",724:"Europe",728:"Africa",729:"Africa",
+    732:"Africa",740:"South America",748:"Africa",752:"Europe",756:"Europe",
+    760:"Asia",762:"Asia",764:"Asia",768:"Africa",776:"Oceania",
+    780:"North America",784:"Asia",788:"Africa",792:"Asia",795:"Asia",
+    796:"North America",798:"Oceania",800:"Africa",804:"Europe",807:"Europe",
+    818:"Africa",820:"Asia",826:"Europe",834:"Africa",840:"North America",
+    850:"North America",854:"Africa",858:"South America",860:"Asia",
+    862:"South America",876:"Oceania",882:"Oceania",887:"Asia",
+    894:"Africa",10:"Antarctica",
+    // territories
+    660:"North America",92:"North America",
+  };
+}
+
+// Total sovereign/territory count per continent used for % calculation
+const CONTINENT_TOTALS = {
+  'Africa': 54,
+  'Asia': 48,
+  'Europe': 44,
+  'North America': 41,
+  'South America': 12,
+  'Oceania': 14,
+  'Antarctica': 1,
+};
+const CONTINENT_COLORS = {
+  'Africa':        '#e8a44a',
+  'Asia':          '#5b8dd9',
+  'Europe':        '#4caf92',
+  'North America': '#d95b5b',
+  'South America': '#9b5bd9',
+  'Oceania':       '#d9895b',
+  'Antarctica':    '#7a7f94',
+};
+const WORLD_TOTAL = 195; // UN-recognised + observer states
+
+function renderStats() {
+  const continentMap = getCountryContinent();
+  const nameToId = {};
+  // Build reverse map: country name → numeric ID
+  const nameMap = {}; // populated from allFeatures
+  allFeatures.forEach(f => {
+    const name = f.properties?.name;
+    const id = parseInt(f.id);
+    if (name) nameToId[name] = id;
+  });
+
+  // Count visited per continent
+  const counts = {};
+  Object.keys(CONTINENT_TOTALS).forEach(c => counts[c] = 0);
+  Object.keys(visited).forEach(name => {
+    const id = nameToId[name];
+    const continent = continentMap[id];
+    if (continent && counts[continent] !== undefined) counts[continent]++;
+  });
+
+  const totalVisited = Object.keys(visited).length;
+  const pct = WORLD_TOTAL > 0 ? Math.round((totalVisited / WORLD_TOTAL) * 100) : 0;
+
+  document.getElementById('statsCoverageLabel').textContent = `World Coverage  ${totalVisited}/${WORLD_TOTAL}`;
+  document.getElementById('statsPct').textContent = pct + '%';
+  document.getElementById('statsBarFill').style.width = pct + '%';
+
+  // Render continent rows (only continents with countries in the data, sorted by visited desc)
+  const continents = Object.keys(CONTINENT_TOTALS)
+    .filter(c => c !== 'Antarctica')
+    .sort((a, b) => counts[b] - counts[a]);
+
+  document.getElementById('statsContinents').innerHTML = continents.map(c => {
+    const total = CONTINENT_TOTALS[c];
+    const count = counts[c];
+    const pctC = total > 0 ? Math.round((count / total) * 100) : 0;
+    const color = CONTINENT_COLORS[c];
+    return `<div class="stat-row">
+      <span class="stat-continent" title="${c}">${c}</span>
+      <div class="stat-mini-track">
+        <div class="stat-mini-fill" style="width:${pctC}%;background:${color}"></div>
+      </div>
+      <span class="stat-fraction">${count}/${total}</span>
+    </div>`;
+  }).join('');
+}
+
+function initLayers(geojson) {
+  allFeatures = geojson.features;
+
+  geoJsonLayer = L.geoJSON(geojson, {
+    style: defaultStyle,
+    onEachFeature: onEachFeature,
+  }).addTo(map);
+
+  map.setMaxBounds(null);
+  setTimeout(() => map.invalidateSize(), 100);
+
+  // Restore from localStorage cache on load
+  const saved = localStorage.getItem('countries-visited-session');
+  if (saved) {
+    try {
+      const data = JSON.parse(saved);
+      if (data.visited) {
+        applyData(data);
+        const hint = currentBinId ? 'Map restored ✓' : 'Local data restored ✓';
+        showToast(hint);
+        setTimeout(hideToast, 2500);
+      }
+    } catch(e) {}
+  }
+}
+
+function defaultStyle(feature) {
+  const name = feature.properties.name;
+  if (visited[name]) {
+    const v = visited[name];
+    return {
+      fillColor: darkenColor(v.color, v.count || 1),
+      fillOpacity: 0.65,
+      color: '#ffffff',
+      weight: 0.8,
+      opacity: 0.7,
+      dashArray: null,
+    };
+  }
+  if (wantToVisit[name]) {
+    return {
+      fillColor: 'transparent',
+      fillOpacity: 0,
+      color: '#5b8dd9',
+      weight: 2,
+      opacity: 0.8,
+      dashArray: '6,4',
+    };
+  }
+  return {
+    fillColor: '#2a3550',
+    fillOpacity: 0.7,
+    color: '#3d4d6e',
+    weight: 0.8,
+    opacity: 0.8,
+    dashArray: null,
+  };
+}
+
+function onEachFeature(feature, layer) {
+  const name = feature.properties.name;
+  const isTouch = () => window.matchMedia('(hover: none)').matches;
+
+  layer.on({
+    mouseover(e) {
+      if (isTouch()) return;
+      const l = e.target;
+      if (!visited[name]) {
+        l.setStyle({ fillColor: '#3d5a8a', fillOpacity: 0.8 });
+      } else {
+        l.setStyle({ fillOpacity: 0.85, weight: 2 });
+      }
+      // Use cursor label instead of Leaflet tooltip for consistent look
+      const v = visited[name];
+      const countStr = v ? (v.count >= 11 ? ' ×10+' : v.count > 1 ? ` ×${v.count}` : '') : '';
+      showCursorLabelHover(`${name}${countStr}`);
+    },
+    mouseout(e) {
+      if (isTouch()) return;
+      geoJsonLayer.resetStyle(e.target);
+      hideCursorLabelHover();
+    },
+    click(e) {
+      if (isTouch()) {
+        showCursorLabel(name);
+        setTimeout(() => cursorLabel.classList.remove('visible'), 1500);
+      }
+      if (wtvMode) {
+        // Want to Visit toggle
+        if (wantToVisit[name]) {
+          removeWtv(name);
+        } else {
+          addWtv(layer, name);
+        }
+        return;
+      }
+      if (visited[name]) {
+        incrementVisit(name);
+      } else {
+        const color = getActiveCategoryColor();
+        document.getElementById('colorPicker').value = color;
+        highlightCountry(layer, name, color, true, 1, activeCategoryId);
+      }
+      // Show count label at cursor
+      const count = visited[name] ? visited[name].count : 1;
+      const displayCount = count >= 11 ? '10+' : count;
+      showCursorLabel(`${name}  ×${displayCount}`);
+    }
+  });
+}
+
+// ─── CURSOR LABEL ─────────────────────────────────────────────────────────────
+const cursorLabel = document.getElementById('cursorLabel');
+let cursorLabelTimer = null;
+let hoverActive = false;
+
+document.addEventListener('mousemove', e => {
+  cursorLabel.style.left = e.clientX + 'px';
+  cursorLabel.style.top = e.clientY + 'px';
+});
+
+// Hover: stays visible until mouseout
+function showCursorLabelHover(text) {
+  clearTimeout(cursorLabelTimer);
+  hoverActive = true;
+  cursorLabel.textContent = text;
+  cursorLabel.classList.add('visible');
+}
+
+function hideCursorLabelHover() {
+  hoverActive = false;
+  cursorLabel.classList.remove('visible');
+}
+
+// Click: briefly flashes updated count, then fades
+function showCursorLabel(text) {
+  clearTimeout(cursorLabelTimer);
+  cursorLabel.textContent = text;
+  cursorLabel.classList.add('visible');
+  cursorLabelTimer = setTimeout(() => {
+    if (!hoverActive) cursorLabel.classList.remove('visible');
+  }, 1200);
+}
+// Converts a hex color to HSL, darkens by reducing lightness per visit count,
+// and returns the resulting hex. Count 1 = base color, count 10+ = darkest.
+function darkenColor(hex, count) {
+  // Parse hex to RGB
+  const r = parseInt(hex.slice(1,3),16)/255;
+  const g = parseInt(hex.slice(3,5),16)/255;
+  const b = parseInt(hex.slice(5,7),16)/255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  let h, s, l = (max+min)/2;
+  if (max === min) { h = s = 0; }
+  else {
+    const d = max - min;
+    s = l > 0.5 ? d/(2-max-min) : d/(max+min);
+    switch(max) {
+      case r: h = ((g-b)/d + (g<b?6:0))/6; break;
+      case g: h = ((b-r)/d + 2)/6; break;
+      case b: h = ((r-g)/d + 4)/6; break;
+    }
+  }
+  // Darken: reduce lightness by up to 40% over 10 visits
+  const darkened = Math.max(0.08, l - (l * 0.4 * Math.min(count-1, 9) / 9));
+  // Convert HSL back to hex
+  function hue2rgb(p, q, t) {
+    if (t<0) t+=1; if (t>1) t-=1;
+    if (t<1/6) return p+(q-p)*6*t;
+    if (t<1/2) return q;
+    if (t<2/3) return p+(q-p)*(2/3-t)*6;
+    return p;
+  }
+  let r2,g2,b2;
+  if (s === 0) { r2=g2=b2=darkened; }
+  else {
+    const q = darkened<0.5 ? darkened*(1+s) : darkened+s-darkened*s;
+    const p = 2*darkened-q;
+    r2=hue2rgb(p,q,h+1/3); g2=hue2rgb(p,q,h); b2=hue2rgb(p,q,h-1/3);
+  }
+  const toHex = x => Math.round(x*255).toString(16).padStart(2,'0');
+  return '#'+toHex(r2)+toHex(g2)+toHex(b2);
+}
+
+function highlightCountry(layer, name, color, updateList, count, categoryId) {
+  const visitCount = count || (visited[name] ? visited[name].count : 1);
+  const catId = categoryId !== undefined ? categoryId : (visited[name]?.categoryId ?? activeCategoryId);
+  const displayColor = darkenColor(color, visitCount);
+  visited[name] = { color, layer, count: visitCount, categoryId: catId };
+  layer.setStyle({
+    fillColor: displayColor,
+    fillOpacity: 0.65,
+    color: '#ffffff',
+    weight: 1.2,
+    opacity: 0.9,
+  });
+  if (updateList) { renderList(); renderStats(); checkBruceMode(); }
+}
+
+function incrementVisit(name) {
+  if (!visited[name]) return;
+  const v = visited[name];
+  const newCount = Math.min(v.count + 1, 11); // 11 = internal "10+" state
+  highlightCountry(v.layer, name, v.color, true, newCount);
+}
+
+function decrementVisit(name) {
+  if (!visited[name]) return;
+  const v = visited[name];
+  if (v.count <= 1) return;
+  highlightCountry(v.layer, name, v.color, true, v.count - 1);
+}
+
+function removeCountry(name) {
+  if (visited[name]) {
+    const layer = visited[name].layer;
+    delete visited[name];
+    geoJsonLayer.resetStyle(layer);
+    renderList();
+    renderStats();
+  }
+}
+
+function addWtv(layer, name) {
+  // Remove from visited if present
+  if (visited[name]) removeCountry(name);
+  wantToVisit[name] = { layer };
+  layer.setStyle({
+    fillColor: 'transparent',
+    fillOpacity: 0,
+    color: '#5b8dd9',
+    weight: 2,
+    opacity: 0.8,
+    dashArray: '6,4',
+  });
+  renderList();
+}
+
+function removeWtv(name) {
+  if (wantToVisit[name]) {
+    const layer = wantToVisit[name].layer;
+    delete wantToVisit[name];
+    geoJsonLayer.resetStyle(layer);
+    renderList();
+  }
+}
+
+function findLayerByName(name) {
+  let found = null;
+  geoJsonLayer.eachLayer(l => {
+    if (l.feature && l.feature.properties.name === name) found = l;
+  });
+  return found;
+}
+
+function renderList() {
+  const list = document.getElementById('countryList');
+  const names = Object.keys(visited).sort();
+  const wtvNames = Object.keys(wantToVisit).sort();
+
+  // Counter excludes WTV
+  document.getElementById('counter').textContent = names.length;
+
+  if (names.length === 0 && wtvNames.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <span class="icon">🌍</span>
+      No countries selected yet.<br>Click any country on the map to add it.
+    </div>`;
+    return;
+  }
+
+  let html = '';
+
+  if (names.length > 0) {
+    html += names.map(name => {
+      const v = visited[name];
+      const safeName = name.replace(/'/g, "\\'");
+      const displayCount = v.count >= 11 ? '10+' : v.count;
+      const displayColor = darkenColor(v.color, v.count);
+      const cat = categories[v.categoryId];
+      const catLabel = cat ? (cat.name || `Category ${cat.id + 1}`) : '';
+      const catTag = catLabel ? `<span class="country-cat-tag" style="color:${cat.color};border-color:${cat.color}20;background:${cat.color}18">${catLabel}</span>` : '';
+      return `
+      <div class="country-item" onclick="flyToCountry('${safeName}')">
+        <div class="country-swatch" style="background:${displayColor}"></div>
+        <span class="country-name">${name}</span>
+        ${catTag}
+        <div class="visit-controls" onclick="event.stopPropagation()">
+          <button class="visit-btn" onclick="decrementVisit('${safeName}')" title="Visited less">−</button>
+          <span class="visit-count">${displayCount}</span>
+          <button class="visit-btn" onclick="incrementVisit('${safeName}')" title="Visited more">+</button>
+        </div>
+        <span class="country-remove" onclick="event.stopPropagation(); removeCountry('${safeName}')">✕</span>
+      </div>`;
+    }).join('');
+  }
+
+  if (wtvNames.length > 0) {
+    html += `<div class="wtv-section-header">🧭 Want to Visit</div>`;
+    html += wtvNames.map(name => {
+      const safeName = name.replace(/'/g, "\\'");
+      return `
+      <div class="country-item wtv-item" onclick="flyToCountry('${safeName}')">
+        <div class="country-swatch" style="border:1.5px dashed #5b8dd9;background:transparent"></div>
+        <span class="country-name">${name}</span>
+        <span class="country-remove" onclick="event.stopPropagation(); removeWtv('${safeName}')">✕</span>
+      </div>`;
+    }).join('');
+  }
+
+  list.innerHTML = html;
+}
+
+function flyToCountry(name) {
+  const layer = visited[name]?.layer;
+  if (layer) {
+    map.flyToBounds(layer.getBounds(), { duration: 0.8, padding: [40, 40] });
+  }
+}
+
+function clearAll() {
+  if (Object.keys(visited).length === 0 && Object.keys(wantToVisit).length === 0) return;
+  if (!confirm('Clear all highlighted countries?')) return;
+  Object.keys(visited).forEach(name => {
+    const layer = visited[name].layer;
+    delete visited[name];
+    if (geoJsonLayer) geoJsonLayer.resetStyle(layer);
+  });
+  Object.keys(wantToVisit).forEach(name => {
+    const layer = wantToVisit[name].layer;
+    delete wantToVisit[name];
+    if (geoJsonLayer) geoJsonLayer.resetStyle(layer);
+  });
+  renderList();
+  renderStats();
+}
+
+// ─── CLOUD SAVE / LOAD ────────────────────────────────────────────────────────
+
+function buildSaveData() {
+  const data = {
+    visited: {},
+    wantToVisit: {},
+    categories: categories.map(c => ({ id: c.id, name: c.name, color: c.color })),
+    activeCategoryId,
+    color: getActiveCategoryColor(),
+    savedAt: new Date().toISOString(),
+  };
+  Object.entries(visited).forEach(([name, v]) => {
+    data.visited[name] = { color: v.color, count: v.count || 1, categoryId: v.categoryId ?? 0 };
+  });
+  Object.keys(wantToVisit).forEach(name => {
+    data.wantToVisit[name] = true;
+  });
+  return data;
+}
+
+function applyData(data) {
+  // Clear map
+  Object.entries(visited).forEach(([, v]) => { if (geoJsonLayer) geoJsonLayer.resetStyle(v.layer); });
+  Object.keys(visited).forEach(k => delete visited[k]);
+  Object.entries(wantToVisit).forEach(([, v]) => { if (geoJsonLayer) geoJsonLayer.resetStyle(v.layer); });
+  Object.keys(wantToVisit).forEach(k => delete wantToVisit[k]);
+
+  // Restore categories
+  if (data.categories) {
+    data.categories.forEach(c => {
+      if (categories[c.id]) {
+        categories[c.id].name = c.name || '';
+        categories[c.id].color = c.color || CAT_COLORS[c.id];
+      }
+    });
+  }
+  if (data.activeCategoryId !== undefined) activeCategoryId = data.activeCategoryId;
+
+  // Restore visited
+  Object.entries(data.visited).forEach(([name, val]) => {
+    const layer = findLayerByName(name);
+    if (!layer) return;
+    const color = typeof val === 'string' ? val : val.color;
+    const count = typeof val === 'object' ? (val.count || 1) : 1;
+    const categoryId = typeof val === 'object' ? (val.categoryId ?? 0) : 0;
+    highlightCountry(layer, name, color, false, count, categoryId);
+  });
+
+  // Restore want to visit
+  if (data.wantToVisit) {
+    Object.keys(data.wantToVisit).forEach(name => {
+      const layer = findLayerByName(name);
+      if (layer) addWtv(layer, name);
+    });
+  }
+
+  renderCategoryPicker();
+  renderList();
+  renderStats();
+}
+
+async function saveToCloud() {
+  if (Object.keys(visited).length === 0) {
+    showToast('Nothing to save yet — click some countries first!');
+    setTimeout(hideToast, 2500);
+    return;
+  }
+
+  const data = buildSaveData();
+  // Always keep a local cache too
+  localStorage.setItem('countries-visited-session', JSON.stringify(data));
+
+  showToast('Saving…');
+
+  try {
+    let binId = currentBinId;
+    let response;
+
+    if (binId) {
+      // Update existing bin
+      response = await fetch(`${JSONBIN_API}/${binId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Access-Key': JSONBIN_KEY,
+        },
+        body: JSON.stringify(data),
+      });
+    } else {
+      // Create new bin
+      response = await fetch(JSONBIN_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Access-Key': JSONBIN_KEY,
+          'X-Bin-Name': 'countries-visited',
+          'X-Bin-Private': 'true',
+        },
+        body: JSON.stringify(data),
+      });
+    }
+
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const result = await response.json();
+
+    // Extract bin ID from response
+    if (!binId) {
+      binId = result.metadata?.id || result.record?.id || result.id;
+      if (!binId && result.metadata) binId = result.metadata.id;
+      currentBinId = binId;
+      localStorage.setItem('countries-visited-bin-id', binId);
+      setCookie('countries-visited-bin-id', binId, 365);
+      showCodeInBar(binId);
+    }
+
+    hideToast();
+    showSaveModal(binId);
+
+  } catch(e) {
+    console.error('Save error:', e);
+    showToast('Save failed: ' + e.message);
+    setTimeout(hideToast, 3000);
+  }
+}
+
+async function loadFromCloud() {
+  const input = document.getElementById('loadCodeInput');
+  const binId = input.value.trim();
+  const errorEl = document.getElementById('loadError');
+  errorEl.textContent = '';
+
+  if (!binId) {
+    errorEl.textContent = 'Please enter your save code.';
+    return;
+  }
+
+  const loadBtn = document.querySelector('#loadModal .btn-primary');
+  loadBtn.textContent = 'Loading…';
+  loadBtn.disabled = true;
+
+  try {
+    const response = await fetch(`${JSONBIN_API}/${binId}/latest`, {
+      headers: { 'X-Access-Key': JSONBIN_KEY },
+    });
+
+    if (response.status === 401) throw new Error('Invalid save code.');
+    if (response.status === 404) throw new Error('Save code not found.');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+
+    const result = await response.json();
+    const data = result.record;
+
+    if (!data || !data.visited) throw new Error('Invalid save data.');
+
+    applyData(data);
+
+    // Remember this bin ID for future saves
+    currentBinId = binId;
+    localStorage.setItem('countries-visited-bin-id', binId);
+    setCookie('countries-visited-bin-id', binId, 365);
+    localStorage.setItem('countries-visited-session', JSON.stringify(data));
+    showCodeInBar(binId);
+
+    closeLoadModal();
+    showToast('Map loaded ✓');
+    setTimeout(hideToast, 2500);
+
+  } catch(e) {
+    errorEl.textContent = e.message;
+  } finally {
+    loadBtn.textContent = 'Load';
+    loadBtn.disabled = false;
+  }
+}
+
+// ─── MODALS ───────────────────────────────────────────────────────────────────
+
+function showSaveModal(binId) {
+  document.getElementById('saveCodeDisplay').textContent = binId;
+  document.getElementById('copyBtn').textContent = 'Copy';
+  showCodeInBar(binId);
+  document.getElementById('saveModal').classList.add('open');
+}
+
+function closeSaveModal() {
+  document.getElementById('saveModal').classList.remove('open');
+}
+
+function showLoadModal() {
+  const input = document.getElementById('loadCodeInput');
+  // Pre-fill from cookie first, then localStorage, then currentBinId
+  const saved = getCookie('countries-visited-bin-id')
+    || localStorage.getItem('countries-visited-bin-id')
+    || currentBinId
+    || '';
+  input.value = saved;
+  document.getElementById('loadError').textContent = '';
+  document.getElementById('loadModal').classList.add('open');
+  // Select all text so user can easily replace it
+  setTimeout(() => { input.focus(); input.select(); }, 100);
+}
+
+function closeLoadModal() {
+  document.getElementById('loadModal').classList.remove('open');
+}
+
+function copySaveCode() {
+  // Get code from whichever element has it
+  const code = document.getElementById('codeDisplayValue').textContent
+    || document.getElementById('saveCodeDisplay').textContent
+    || currentBinId || '';
+  if (!code) return;
+  navigator.clipboard.writeText(code).then(() => {
+    // Update both copy buttons
+    ['copyBtn', 'codeDisplay'].forEach(id => {
+      const el = document.getElementById(id);
+      const btn = el?.classList.contains('btn') ? el : el?.querySelector('.btn-copy');
+      if (btn) { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 2000); }
+    });
+  }).catch(() => {
+    const el = document.getElementById('codeDisplayValue');
+    const range = document.createRange();
+    range.selectNode(el);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+  });
+}
+
+// ─── COLOR SWATCHES ───────────────────────────────────────────────────────────
+// ─── CATEGORIES ──────────────────────────────────────────────────────────────
+const CAT_COLORS = ['#c9a84c','#4caf92','#5b8dd9','#d95b5b','#9b5bd9','#d9895b'];
+
+let categories = [
+  { id: 0, name: 'Home Country', color: CAT_COLORS[0] },
+  { id: 1, name: '', color: CAT_COLORS[1] },
+  { id: 2, name: '', color: CAT_COLORS[2] },
+  { id: 3, name: '', color: CAT_COLORS[3] },
+  { id: 4, name: '', color: CAT_COLORS[4] },
+  { id: 5, name: '', color: CAT_COLORS[5] },
+];
+let activeCategoryId = 0;
+let wtvMode = false;          // Want to Visit mode
+let wantToVisit = {};         // { countryName: { layer } }
+let catPopover = null;
+
+function getActiveCategoryColor() {
+  return categories[activeCategoryId]?.color || CAT_COLORS[0];
+}
+
+function renderCategoryPicker() {
+  const picker = document.getElementById('categoryPicker');
+  picker.innerHTML = categories.map(cat => {
+    const label = cat.name || `Category ${cat.id + 1}`;
+    const isActive = cat.id === activeCategoryId && !wtvMode;
+    return `<div class="cat-slot${isActive ? ' active' : ''}" 
+      data-catid="${cat.id}"
+      onclick="selectCategory(${cat.id}, event)"
+      ondblclick="openCatEditor(${cat.id}, event)"
+      title="${label} (double-click to rename)">
+      <div class="cat-dot" style="background:${cat.color}"></div>
+      <span class="cat-name">${label}</span>
+    </div>`;
+  }).join('');
+  // Keep colorPicker in sync
+  document.getElementById('colorPicker').value = getActiveCategoryColor();
+}
+
+function selectCategory(id, e) {
+  if (e) e.stopPropagation();
+  activeCategoryId = id;
+  wtvMode = false;
+  document.getElementById('wtvBtn').classList.remove('active');
+  renderCategoryPicker();
+  document.getElementById('colorPicker').value = getActiveCategoryColor();
+}
+
+function toggleWtvMode() {
+  wtvMode = !wtvMode;
+  document.getElementById('wtvBtn').classList.toggle('active', wtvMode);
+  // Deselect category highlight when in WTV mode
+  renderCategoryPicker();
+}
+
+function openCatEditor(id, e) {
+  if (e) e.stopPropagation();
+  closeCatPopover();
+  const slot = document.querySelector(`.cat-slot[data-catid="${id}"]`);
+  const rect = slot.getBoundingClientRect();
+  const cat = categories[id];
+
+  const div = document.createElement('div');
+  div.className = 'cat-popover';
+  div.id = 'catPopover';
+  div.innerHTML = `
+    <div class="cat-popover-title">Edit Category</div>
+    <input type="text" id="catNameInput" value="${cat.name}" placeholder="Category name…" maxlength="20">
+    <div class="cat-popover-colors">
+      ${CAT_COLORS.map(c => `<div class="cat-popover-swatch${c===cat.color?' active':''}" 
+        style="background:${c}" data-color="${c}" onclick="selectCatColor(${id},'${c}')"></div>`).join('')}
+    </div>
+    <div class="cat-popover-actions">
+      <button class="btn btn-primary" style="flex:1;font-size:0.72rem;padding:5px 8px" onclick="saveCatEdit(${id})">Save</button>
+      <button class="btn" style="font-size:0.72rem;padding:5px 8px" onclick="closeCatPopover()">Cancel</button>
+    </div>`;
+  document.body.appendChild(div);
+  catPopover = div;
+
+  // Position below the slot
+  const top = rect.bottom + 6;
+  const left = Math.min(rect.left, window.innerWidth - 210);
+  div.style.top = top + 'px';
+  div.style.left = left + 'px';
+  setTimeout(() => document.getElementById('catNameInput')?.focus(), 50);
+}
+
+function selectCatColor(id, color) {
+  document.querySelectorAll('.cat-popover-swatch').forEach(s => s.classList.toggle('active', s.dataset.color === color));
+}
+
+function saveCatEdit(id) {
+  const nameInput = document.getElementById('catNameInput');
+  const name = nameInput ? nameInput.value.trim() : '';
+  const activeSwatch = document.querySelector('.cat-popover-swatch.active');
+  const color = activeSwatch ? activeSwatch.dataset.color : categories[id].color;
+  categories[id].name = name;
+  categories[id].color = color;
+  // Update any countries already using this category
+  Object.keys(visited).forEach(n => {
+    const v = visited[n];
+    if (v.categoryId === id) {
+      v.color = color;
+      const displayColor = darkenColor(color, v.count || 1);
+      v.layer.setStyle({ fillColor: displayColor, fillOpacity: 0.65, color: '#ffffff', weight: 1.2, opacity: 0.9 });
+    }
+  });
+  closeCatPopover();
+  renderCategoryPicker();
+  renderList();
+}
+
+function closeCatPopover() {
+  const el = document.getElementById('catPopover');
+  if (el) el.remove();
+  catPopover = null;
+}
+
+// Close popover on outside click
+document.addEventListener('click', e => {
+  if (catPopover && !catPopover.contains(e.target) && !e.target.closest('.cat-slot')) {
+    closeCatPopover();
+  }
+});
+
+function setActiveSwatchColor(hex) {
+  // Legacy: find matching category and activate it
+  const match = categories.find(c => c.color.toLowerCase() === hex.toLowerCase());
+  if (match) activeCategoryId = match.id;
+  renderCategoryPicker();
+}
+
+function initSwatches() {
+  renderCategoryPicker();
+}
+window.selectCategory = selectCategory;
+window.toggleWtvMode = toggleWtvMode;
+window.openCatEditor = openCatEditor;
+window.selectCatColor = selectCatColor;
+window.saveCatEdit = saveCatEdit;
+window.closeCatPopover = closeCatPopover;
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.opacity = '1';
+}
+function hideToast() {
+  document.getElementById('toast').style.opacity = '0';
+}
+
+// ─── START ────────────────────────────────────────────────────────────────────
+// ─── EXPORT MAP AS IMAGE ─────────────────────────────────────────────────────
+async function shareAsImage() {
+  const btn = document.querySelector('[onclick="shareAsImage()"]');
+  const origText = btn.textContent;
+  btn.textContent = 'Generating…';
+  btn.disabled = true;
+
+  try {
+    const mapEl = document.getElementById('map');
+    const totalVisited = Object.keys(visited).length;
+    const mapW = mapEl.offsetWidth;
+    const mapH = mapEl.offsetHeight;
+    const headerH = 64;
+    const mapRect = mapEl.getBoundingClientRect();
+
+    const out = document.createElement('canvas');
+    out.width = mapW;
+    out.height = mapH + headerH;
+    const ctx = out.getContext('2d');
+
+    // ── 1. Dark ocean background
+    ctx.fillStyle = '#0d1526';
+    ctx.fillRect(0, headerH, mapW, mapH);
+
+    // ── 2. Composite tile images (base64 data URIs — safe to draw)
+    const tileImgs = mapEl.querySelectorAll('img');
+    tileImgs.forEach(img => {
+      try {
+        const r = img.getBoundingClientRect();
+        ctx.drawImage(img, r.left - mapRect.left, headerH + (r.top - mapRect.top), r.width, r.height);
+      } catch(e) { /* skip if tainted */ }
+    });
+
+    const hexToRgba = (hex, alpha) => {
+      const r = parseInt(hex.slice(1,3),16);
+      const g = parseInt(hex.slice(3,5),16);
+      const b = parseInt(hex.slice(5,7),16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    };
+
+    // ── 3. Draw GeoJSON countries — antimeridian-safe path builder
+    // Breaks the path whenever consecutive projected points jump > half the canvas
+    // width, which is what causes the horizontal bars on antimeridian-crossing rings.
+    const buildPath = (ring) => {
+      const pts = ring.map(([lng, lat]) => {
+        const normLng = ((lng + 180) % 360 + 360) % 360 - 180;
+        const pt = map.latLngToContainerPoint(L.latLng(lat, normLng));
+        return [pt.x, headerH + pt.y];
+      });
+      // Draw as sub-paths, breaking on antimeridian jumps
+      const threshold = mapW * 0.4;
+      let started = false;
+      pts.forEach(([x, y], i) => {
+        if (i === 0) { ctx.moveTo(x, y); started = true; return; }
+        const dx = Math.abs(x - pts[i-1][0]);
+        if (dx > threshold) {
+          // Break — start a new moveTo instead of lineTo
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      if (started) ctx.closePath();
+    };
+
+    const drawFeature = (geom, fillColor, fillOpacity, strokeColor, strokeOpacity, strokeWeight) => {
+      ctx.beginPath();
+      const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
+      polys.forEach(coords => coords.forEach(ring => buildPath(ring)));
+      ctx.fillStyle = hexToRgba(fillColor, fillOpacity);
+      ctx.fill('evenodd');
+      ctx.strokeStyle = hexToRgba(strokeColor, strokeOpacity);
+      ctx.lineWidth = strokeWeight;
+      ctx.stroke();
+    };
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, headerH, mapW, mapH);
+    ctx.clip();
+
+    // Unvisited first
+    allFeatures.forEach(feature => {
+      const name = feature.properties?.name;
+      if (visited[name] || !feature.geometry) return;
+      drawFeature(feature.geometry, '#2a3550', 0.9, '#3d4d6e', 0.7, 0.5);
+    });
+
+    // Visited on top
+    allFeatures.forEach(feature => {
+      const name = feature.properties?.name;
+      const v = visited[name];
+      if (!v || !feature.geometry) return;
+      drawFeature(feature.geometry, darkenColor(v.color, v.count || 1), 0.85, '#ffffff', 0.85, 1.0);
+    });
+
+    // ── 4. Vignette overlay for depth
+    const vig = ctx.createRadialGradient(mapW/2, headerH + mapH/2, mapH * 0.25, mapW/2, headerH + mapH/2, mapH * 0.85);
+    vig.addColorStop(0, 'rgba(0,0,0,0)');
+    vig.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, headerH, mapW, mapH);
+
+    ctx.restore();
+
+    // ── 5. Header bar
+    const grad = ctx.createLinearGradient(0, 0, mapW, 0);
+    grad.addColorStop(0, '#0f1117');
+    grad.addColorStop(1, '#1a2035');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, mapW, headerH);
+    ctx.fillStyle = '#c9a84c';
+    ctx.fillRect(0, headerH - 2, mapW, 2);
+
+    ctx.fillStyle = '#e8c96d';
+    ctx.font = 'bold 28px Georgia, serif';
+    ctx.textBaseline = 'middle';
+    const titleText = 'Countries Visited';
+    ctx.fillText(titleText, 24, headerH / 2);
+    const titleW = ctx.measureText(titleText).width;
+
+    // Count right next to title, same color, slightly smaller
+    const countStr = `${totalVisited} / ${WORLD_TOTAL}`;
+    ctx.font = '20px Georgia, serif';
+    ctx.fillStyle = 'rgba(232, 201, 109, 0.7)';
+    ctx.fillText(countStr, 24 + titleW + 16, headerH / 2);
+
+    // ── 6. Download
+    const link = document.createElement('a');
+    link.download = 'countries-visited.png';
+    link.href = out.toDataURL('image/png');
+    link.click();
+
+  } catch (err) {
+    console.error('Export failed:', err);
+    showToast('Export failed: ' + err.message);
+    setTimeout(hideToast, 3500);
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+// ─── SEARCH ───────────────────────────────────────────────────────────────────
+let searchActiveIndex = -1;
+
+function getAllCountryNames() {
+  // Pull names from allFeatures (loaded GeoJSON) for comprehensive search
+  return allFeatures.map(f => f.properties?.name).filter(Boolean).sort();
+}
+
+function onSearchInput() {
+  const input = document.getElementById('countrySearch');
+  const q = input.value.trim();
+  const clearBtn = document.getElementById('searchClear');
+  clearBtn.style.display = q ? 'block' : 'none';
+  searchActiveIndex = -1;
+  if (!q) { hideSearchResults(); return; }
+  showSearchResults(q);
+}
+
+function showSearchResults(q) {
+  const lower = q.toLowerCase();
+  const all = getAllCountryNames();
+  const matches = all.filter(n => n.toLowerCase().includes(lower)).slice(0, 12);
+  const el = document.getElementById('searchResults');
+
+  if (!matches.length) {
+    el.innerHTML = `<div class="search-no-results">No countries found</div>`;
+    el.style.display = 'block';
+    return;
+  }
+
+  el.innerHTML = matches.map((name, i) => {
+    const v = visited[name];
+    const swatchColor = v ? darkenColor(v.color, v.count || 1) : 'transparent';
+    const swatchBorder = v ? '' : 'border:1px dashed var(--border)';
+    const badge = v ? `<span class="search-result-badge">×${v.count >= 11 ? '10+' : v.count}</span>` : '';
+    const safeName = name.replace(/'/g, "\\'");
+    return `<div class="search-result-item" data-index="${i}" onclick="selectSearchResult('${safeName}')">
+      <div class="search-result-swatch" style="background:${swatchColor};${swatchBorder}"></div>
+      <span class="search-result-name">${name}</span>
+      ${badge}
+    </div>`;
+  }).join('');
+  el.style.display = 'block';
+}
+
+function hideSearchResults() {
+  const el = document.getElementById('searchResults');
+  el.style.display = 'none';
+  el.innerHTML = '';
+  searchActiveIndex = -1;
+}
+
+function selectSearchResult(name) {
+  // Fly to country
+  const layer = visited[name]?.layer || findLayerByName(name);
+  if (layer) {
+    map.flyToBounds(layer.getBounds(), { duration: 0.8, padding: [60, 60] });
+  }
+  // Clear search
+  document.getElementById('countrySearch').value = '';
+  document.getElementById('searchClear').style.display = 'none';
+  hideSearchResults();
+}
+
+function clearSearch() {
+  document.getElementById('countrySearch').value = '';
+  document.getElementById('searchClear').style.display = 'none';
+  hideSearchResults();
+  document.getElementById('countrySearch').focus();
+}
+
+function onSearchKey(e) {
+  const el = document.getElementById('searchResults');
+  const items = el.querySelectorAll('.search-result-item');
+
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    // 🤫 Secret Bruce Mode activation
+    const val = document.getElementById('countrySearch').value.trim().toLowerCase();
+    if (val === 'bruce mode') {
+      activateBruceMode();
+      clearSearch();
+      return;
+    }
+    const active = searchActiveIndex >= 0 ? items[searchActiveIndex] : items[0];
+    if (active) active.click();
+    return;
+  }
+
+  if (!items.length) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    searchActiveIndex = Math.min(searchActiveIndex + 1, items.length - 1);
+    updateSearchActive(items);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    searchActiveIndex = Math.max(searchActiveIndex - 1, 0);
+    updateSearchActive(items);
+  } else if (e.key === 'Escape') {
+    clearSearch();
+  }
+}
+
+// ─── BRUCE MODE 🤫 ────────────────────────────────────────────────────────────
+let bruceMode = false;
+let bruceCountriesAtLastPop = 0;
+
+const BRUCE_MOMENTS = [
+  { quote: "I feel the need... the need for speed!", movie: "Top Gun (1986)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_01_top_gun.jpg" },
+  { quote: "You can't handle the truth!", movie: "A Few Good Men (1992)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_02_a_few_good_men.jpg" },
+  { quote: "Life is like a box of chocolates.", movie: "Forrest Gump (1994)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_03_forrest_gump.jpg" },
+  { quote: "Houston, we have a problem.", movie: "Apollo 13 (1995)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_04_apollo_13.jpg" },
+  { quote: "Show me the money!", movie: "Jerry Maguire (1996)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_05_jerry_maguire.jpg" },
+  { quote: "Get busy living, or get busy dying.", movie: "The Shawshank Redemption (1994)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_06_shawshank.jpg" },
+  { quote: "Why so serious?", movie: "The Dark Knight (2008)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_07_dark_knight.jpg" },
+  { quote: "I'll be back.", movie: "The Terminator (1984)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_08_terminator.jpg" },
+  { quote: "Say 'what' again. I dare you.", movie: "Pulp Fiction (1994)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_09_pulp_fiction.jpg" },
+  { quote: "This is my house, I have to defend it!", movie: "Home Alone (1990)", img: "https://raw.githubusercontent.com/Tuviin/countries-visited/main/bruce_cards/bruce_10_home_alone.jpg" },
+];
+let bruceImageIndex = 0;
+
+function activateBruceMode() {
+  bruceMode = !bruceMode;
+  bruceCountriesAtLastPop = Object.keys(visited).length;
+  if (bruceMode) {
+    showToast('🤫 Bruce Mode activated');
+    setTimeout(hideToast, 2000);
+  } else {
+    showToast('Bruce Mode deactivated');
+    setTimeout(hideToast, 2000);
+  }
+}
+
+function checkBruceMode() {
+  if (!bruceMode) return;
+  const count = Object.keys(visited).length;
+  const diff = count - bruceCountriesAtLastPop;
+  if (diff >= 5) {
+    bruceCountriesAtLastPop = count;
+    showBruceImage();
+  }
+}
+
+function showBruceImage() {
+  const moment = BRUCE_MOMENTS[bruceImageIndex % BRUCE_MOMENTS.length];
+  bruceImageIndex++;
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.4s;
+  `;
+
+  const card = document.createElement('div');
+  card.style.cssText = `
+    background: #0f1117;
+    border: 3px solid #c9a84c;
+    border-radius: 16px;
+    padding: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.85);
+    text-align: center;
+    max-width: 260px;
+  `;
+
+  const img = document.createElement('img');
+  img.src = moment.img;
+  img.style.cssText = `
+    width: 236px;
+    border-radius: 8px;
+    display: block;
+    margin: 0 auto;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  `;
+
+  card.appendChild(img);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => { overlay.style.opacity = '1'; });
+  });
+
+  setTimeout(() => {
+    overlay.style.opacity = '0';
+    setTimeout(() => overlay.remove(), 450);
+  }, 3000);
+}
+window.activateBruceMode = activateBruceMode;
+
+function updateSearchActive(items) {
+  items.forEach((item, i) => {
+    item.classList.toggle('active', i === searchActiveIndex);
+    if (i === searchActiveIndex) item.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+// Close search results when clicking outside
+document.addEventListener('click', e => {
+  if (!e.target.closest('.sidebar-header')) hideSearchResults();
+});
+
+window.onSearchInput = onSearchInput;
+window.onSearchKey = onSearchKey;
+window.clearSearch = clearSearch;
+window.selectSearchResult = selectSearchResult;
+
+
+window.saveToCloud = saveToCloud;
+window.showLoadModal = showLoadModal;
+window.closeLoadModal = closeLoadModal;
+window.loadFromCloud = loadFromCloud;
+window.showSaveModal = showSaveModal;
+window.closeSaveModal = closeSaveModal;
+window.copySaveCode = copySaveCode;
+window.clearAll = clearAll;
+window.shareAsImage = shareAsImage;
+window.flyToCountry = flyToCountry;
+window.removeCountry = removeCountry;
+window.removeWtv = removeWtv;
+window.incrementVisit = incrementVisit;
+window.decrementVisit = decrementVisit;
+
+initSwatches();
+initCodeBar();
+init();
+
+// Hide initial toast after 3s
+setTimeout(hideToast, 3000);
+
+}); // end DOMContentLoaded
+</script>
+</body>
+</html>
